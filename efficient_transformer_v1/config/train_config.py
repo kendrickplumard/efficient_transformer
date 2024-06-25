@@ -1,11 +1,11 @@
 from dataclasses import dataclass
-# from ..model import AnyModalMirasolConfig
-from efficient_transformer.model import AnyModalMirasolConfig
+
+from efficient_transformer_v1.model import AnyModalMirasolConfig
 
 @dataclass
 class TRAIN_CONFIG:
   seed: int = 42
-  dataset: str = "shakespear_char" # "shakespear_char"
+  dataset: str = "data/shakespear_char/" # "shakespear_char"
   model_config: AnyModalMirasolConfig = AnyModalMirasolConfig(block_size=768, vocab_size=None, n_layer_enc_dec=2, n_head=8, n_embd = [64, 128, 256],
                                       dropout=0.1, enc_dropout = 0.1, enc_type = 'tranfo_enc', bias=False, activation = 'gelu', normalization = 'rmsnorm',
                                       noisy_embd_alpha = 0.0, nb_mem_token = 0, muP=False, apply_gradient_checkpointing = False, gradient_checkpoint_sequential_factor = 2,

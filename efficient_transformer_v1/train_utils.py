@@ -1,6 +1,6 @@
-import torch
 import math
 import numpy as np
+import torch
 
 from contextlib import nullcontext
 from functools import partial
@@ -8,10 +8,8 @@ from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
 from typing import Dict, Union
 
-# from config.train_config import TRAIN_CONFIG
-# from model import AnyModalMirasol, AnyModalMirasolConfig
-from efficient_transformer.config.train_config import TRAIN_CONFIG
-from efficient_transformer.model import AnyModalMirasol, AnyModalMirasolConfig
+from efficient_transformer_v1.config.train_config import TRAIN_CONFIG
+from efficient_transformer_v1.model import AnyModalMirasol, AnyModalMirasolConfig
 
 @torch.no_grad()
 def writeLogs(model: torch.nn.Module, input: torch.Tensor, writer: SummaryWriter, losses: Dict[str, float], iter: int, lr: float) -> None:
@@ -171,8 +169,6 @@ def init_model_stats(model, sample):
       activation_stats[name] = []
       module.register_forward_hook(partial(save_activation_stats, name))
 
-  # dummy forward pass to init activations
-  # x = torch.randint(1, 640, (640,)).unsqueeze(0).to(device)
   device = 'cuda' if torch.cuda.is_available() else 'cpu'
   model(sample.to(device))
   activation_stats_history = {name: [] for name in activation_stats.keys()}

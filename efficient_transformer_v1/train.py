@@ -1,25 +1,31 @@
-import os
-import time
-import pickle
-from tqdm import tqdm
-import copy
-from contextlib import nullcontext
-import psutil
+import argparse
 import atexit
-
+import copy
 import numpy as np
-from pathlib import Path
+import os
+import pickle
+import psutil
+import time
 import torch
 
-from torch.utils.tensorboard import SummaryWriter
+from contextlib import nullcontext
+from pathlib import Path
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
-from efficient_transformer.train_utils import *
+from efficient_transformer_v1.train_utils import *
 
 torch._dynamo.config.suppress_errors = True
 torch.autograd.set_detect_anomaly(True)
 
 main_timer = time.time()
+
+# Parse command-line arguments
+parser = argparse.ArgumentParser()
+parser.add_argument('--ckpt_filename', type=str, default=f'ckpt_nl_{TRAIN_CONFIG().model_config.n_layer_enc_dec}_nh_{TRAIN_CONFIG().model_config.n_head}_nembd_{TRAIN_CONFIG().model_config.n_embd}_dr_{TRAIN_CONFIG().model_config.dropout}_wd_{TRAIN_CONFIG().weight_decay}.pt', 
+                    help='Name of the checkpoint file')
+args = parser.parse_args()
 
 train_config = TRAIN_CONFIG()
 tokens_per_iter = train_config.gradient_accumulation_steps * train_config.maxBS * train_config.model_config.block_size
@@ -27,7 +33,7 @@ print(f"tokens per iteration will be at most: {tokens_per_iter:,}")
 
 
 os.makedirs(train_config.out_dir, exist_ok=True)
-ckpt_filename = f'ckpt_nl_{train_config.model_config.n_layer_enc_dec}_nh_{train_config.model_config.n_head}_nembd_{train_config.model_config.n_embd}_dr_{train_config.model_config.dropout}_wd_{train_config.weight_decay}.pt' # ici utilise default config si from resume et entre temps default config a changé nom pas approprié
+ckpt_filename = args.ckpt_filename  # Use the provided checkpoint filename
 config = copy.deepcopy(vars(train_config))
 config['model_config'] = copy.deepcopy(vars(config['model_config'])) # get a dict from the AnyModalMirasolConfig instance
 torch.manual_seed(train_config.seed)
@@ -39,7 +45,7 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device == 'cpu' else torch.amp.autocast(device_type=device, dtype=ptdtype)
-writer = SummaryWriter(log_dir = os.path.join(train_config.log_dir, f'nl_{train_config.model_config.n_layer_enc_dec}_nh_{train_config.model_config.n_head}_nembd_{train_config.model_config.n_embd}_dr_{train_config.model_config.dropout}_wd_{train_config.weight_decay}')) # tensorboard init
+writer = SummaryWriter(log_dir = os.path.join(train_config.log_dir, ckpt_filename)) # tensorboard init
 
 
 
@@ -57,8 +63,8 @@ val_dataloader = DataLoader(dataset = val_dataset,
                             batch_size = train_config.val_batch_size,
                             num_workers = os.cpu_count(),
                             shuffle = False,
-                            pin_memory = True,)
-                            # drop_last = True)
+                            pin_memory = True,
+                            drop_last = True)
 print(f"number of batch in the train set: {len(train_dataloader)}")
 print(f"number of params's update per epoch: {len(train_dataloader) // train_config.gradient_accumulation_steps}")
 
@@ -97,11 +103,9 @@ checkpoint = None # free up memory
 # compile the model
 if train_config.compile:
     print("compiling the model... (takes a ~minute)")
-    # model = torch.compile(model, dynamic = True) # requires PyTorch 2.0
     model = torch.compile(model)
 
 # training loop
-#X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 running_mfu = -1.0
@@ -133,13 +137,11 @@ for epoch in range(start_epoch, train_config.num_epochs):
     coeff_linear_warmup_latent_causal_loss = 1
     max_step_warmup_latent_loss = train_config.latent_causal_loss_warmup_max_step * max_iters
     if (model_args['latent_causal_loss_type'] != None) and (epoch == 0) and (((epoch + 1) * (step + 1)) < max_step_warmup_latent_loss):
-      # print("max_step_warmup_latent_loss: ", max_step_warmup_latent_loss)
       coeff_linear_warmup_latent_causal_loss = ((epoch + 1) * (step + 1)) / max_step_warmup_latent_loss
 
     X, y = X.to(device), y.to(device)
     with ctx:
       logits, loss = model(X, y, coeff_linear_warmup_latent_causal_loss * train_config.latent_causal_modeling_loss_coeff, train_config.step_size_eval)
-      # logits, loss = model(X, y)
       loss = {key: loss[key] / train_config.gradient_accumulation_steps for key in loss} # scale the loss to account for gradient accumulation
 
 

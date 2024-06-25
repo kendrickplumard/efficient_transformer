@@ -1,29 +1,33 @@
 ### test model
 
-import os
-import time
-import math
-import pickle
-import tiktoken
-from contextlib import nullcontext
-
+import argparse
 import numpy as np
-from pathlib import Path
+import os
 import torch
-torch._dynamo.config.suppress_errors = True
+
+from contextlib import nullcontext
 
 from torch.utils.data import DataLoader
 
-from efficient_transformer.config.train_config import TRAIN_CONFIG
-from efficient_transformer.model import AnyModalMirasol, AnyModalMirasolConfig
-from efficient_transformer.train_utils import CustomDataset, estimate_loss
+from efficient_transformer_v1.config.train_config import TRAIN_CONFIG
+from efficient_transformer_v1.model import AnyModalMirasol, AnyModalMirasolConfig
+from efficient_transformer_v1.train_utils import CustomDataset, estimate_loss
+
+torch._dynamo.config.suppress_errors = True
 
 train_config = TRAIN_CONFIG()
 
+parser = argparse.ArgumentParser()
+# Add argument for checkpoint filename
+parser.add_argument("--ckpt_filename", type=str, 
+                    help="Name of the checkpoint file to load.", 
+                    default=f'ckpt_nl_{train_config.model_config.n_layer_enc_dec}_nh_{train_config.model_config.n_head}_nembd_{train_config.model_config.n_embd}_dr_{train_config.model_config.dropout}_wd_{train_config.weight_decay}.pt')
+# Parse the arguments
+args = parser.parse_args()
 
 # -----------------------------------------------------------------------------
-# ckpt_filename = ''
-ckpt_filename = f'ckpt_nl_{train_config.model_config.n_layer_enc_dec}_nh_{train_config.model_config.n_head}_nembd_{train_config.model_config.n_embd}_dr_{train_config.model_config.dropout}_wd_{train_config.weight_decay}.pt'
+# Access the checkpoint filename from args
+ckpt_filename = args.ckpt_filename 
 device = 'cuda' if torch.cuda.is_available() else 'cpu' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = True # use PyTorch 2.0 to compile the model to be faster

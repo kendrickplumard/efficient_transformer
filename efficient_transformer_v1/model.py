@@ -1,14 +1,12 @@
-import math
 import inspect
-from dataclasses import dataclass, field
+import math
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.parallel
 
-import torch
-import torch.nn as nn
+from dataclasses import dataclass, field
 from torch.utils.checkpoint import checkpoint_sequential
-
-
 
 class SwiGLU(nn.Module):
   """ Noam Shazeer SwiGLU activation, better in Transformers MLP than others """
