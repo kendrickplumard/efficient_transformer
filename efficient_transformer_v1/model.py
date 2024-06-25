@@ -1,14 +1,12 @@
-import math
 import inspect
-from dataclasses import dataclass, field
+import math
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.parallel
 
-import torch
-import torch.nn as nn
+from dataclasses import dataclass, field
 from torch.utils.checkpoint import checkpoint_sequential
-
-
 
 class SwiGLU(nn.Module):
   """ Noam Shazeer SwiGLU activation, better in Transformers MLP than others """
@@ -101,11 +99,6 @@ class PerceiverEncoder(nn.Module):
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
 
 
-    def rotate_embeddings(self, x):
-        x = x.view(*x.shape[:-1], -1, 2).flip(-1)
-        x[...,0] *= -1
-        return x.flatten(start_dim=-2)
-
     def forward(self, x, local_csa_mem_tokens = None, mem_tokens = None):
         B, ng, lg, C = x.size() # batch size, n_groups, length group, embedding dimensionality (n_embd)
         assert lg >= self.latent_size, "should have at least ls token in the input in order to reduce the size"
@@ -122,14 +115,6 @@ class PerceiverEncoder(nn.Module):
                                     diagonal = lg - self.latent_size + 1) \
                                     .view(1, 1, 1, self.latent_size, lg) # mask one above diag with regular attn, now mask M - N + 1 above diag
 
-        if self.config.pos_embd == 'rope':
-          pos = 10000**((-2 * torch.arange(0, self.out_n_embd // self.n_head, 2, device=x.device) - 1)/ (self.out_n_embd // self.n_head))
-          token_seq = torch.arange(lg, dtype=pos.dtype, device=x.device).unsqueeze(1) @ pos.unsqueeze(0)
-          rotary_embds = torch.cat((token_seq, token_seq), dim=-1)
-          q = (q * rotary_embds[:self.latent_size, :self.latent_size].cos()) + \
-           (self.rotate_embeddings(q) * rotary_embds[:self.latent_size, :self.latent_size].sin())
-          k = (k * rotary_embds.cos()) + \
-           (self.rotate_embeddings(k) * rotary_embds.sin())
 
         # don't need to send a copy of q, k , v # T/lg must be smaller or equal to block_size # (B, ng, nh, ls, hs)
         y = compute_attn(q, k, v, self.attn_dropout, self.flash, self.config, self.training, attn_mask[:, :, :, :self.latent_size, :lg])
@@ -181,10 +166,6 @@ class LocalCausalSelfAttention(nn.Module):
               self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, 1, 1, config.block_size, config.block_size))
 
-    def rotate_embeddings(self, x):
-        x = x.view(*x.shape[:-1], -1, 2).flip(-1) # (B, ng, nh, ls * hs/2, 2)
-        x[...,0] *= -1
-        return x.flatten(start_dim=-2)
 
     def compute_qkv(self, x):
       B, ng, ls, C = x.size()
@@ -232,15 +213,6 @@ class LocalCausalSelfAttention(nn.Module):
         assert self.out_n_embd % self.n_head == 0, f"n_embd ({self.out_n_embd}) must be a multiple of n_head ({self.n_head})"
         # don't need to send a copy bc args aren't modified
         q, k, v = self.compute_qkv(x)
-
-        if self.config.pos_embd == 'rope':
-          pos = 10000**((-2 * torch.arange(0, self.out_n_embd // self.n_head, 2, device=x.device) - 1)/ (self.out_n_embd // self.n_head))
-          token_seq = torch.arange(ls, dtype=pos.dtype, device=x.device).unsqueeze(1) @ pos.unsqueeze(0)
-          rotary_embds = torch.cat((token_seq, token_seq), dim=-1)
-          q = (q * rotary_embds.cos()) + \
-           (self.rotate_embeddings(q) * rotary_embds.sin())
-          k = (k * rotary_embds.cos()) + \
-           (self.rotate_embeddings(k) * rotary_embds.sin())
 
         # (B, ng, nh, ls, ls) if not self.soft_experts (B, ng, nse, nh, ls, ls) if self.soft_experts
         if not self.flash:
@@ -309,10 +281,6 @@ class GlobalCausalSelfAttention(nn.Module):
               self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                           .view(1, 1, 1, config.block_size, config.block_size))
 
-    def rotate_embeddings(self, x):
-        x = x.view(*x.shape[:-1], -1, 2).flip(-1) # divide by 2 the head size
-        x[...,0] *= -1
-        return x.flatten(start_dim=-2)
 
     def compute_qkv(self, x):
         B, T, C = x.size()
@@ -354,15 +322,6 @@ class GlobalCausalSelfAttention(nn.Module):
         # don't need to send a copy bc args aren't modified
         q, k, v = self.compute_qkv(x)
 
-
-        if self.config.pos_embd == 'rope':
-          pos = 10000**((-2 * torch.arange(0, C // self.n_head, 2, device=x.device) - 1)/ (C // self.n_head))
-          token_seq = torch.arange(T, dtype=pos.dtype, device=x.device).unsqueeze(1) @ pos.unsqueeze(0)
-          rotary_embds = torch.cat((token_seq, token_seq), dim=-1)
-          q = (q * rotary_embds.cos()) + \
-            (self.rotate_embeddings(q) * rotary_embds.sin())
-          k = (k * rotary_embds.cos()) + \
-            (self.rotate_embeddings(k) * rotary_embds.sin())
 
         # (B, nh, T, T)
         if not self.flash:
@@ -688,7 +647,7 @@ class AnyModalMirasolConfig:
     muP: bool = True # hyper-param transfer muP
     apply_gradient_checkpointing: bool = False # trade compute for memory
     gradient_checkpoint_sequential_factor: int = 2
-    pos_embd: str = 'simple' # simple, rope, no
+    pos_embd: str = 'simple' # simple, no
     n_groups: int = 8
     latent_size: list[int] = field(default_factory=lambda: [64, 32, 16])
     n_block_local_global_causal_sa: int = 2
@@ -878,7 +837,7 @@ class AnyModalMirasol(nn.Module):
           eps = 2 * torch.rand(1) - 1
           tok_emb += ((self.config.noisy_embd_alpha / math.sqrt(tok_emb.size(-2) * tok_emb.size(-1))) * eps).to(device)
 
-        if self.config.pos_embd == 'no' or self.config.pos_embd == 'rope':
+        if self.config.pos_embd == 'no':
           pos_emb = torch.zeros(t, self.config.n_embd[0], dtype=torch.long, device=device) # (t, n_embd)
         else:
           pos_emb = self.pos_embd_layers[0](torch.arange(0, t, dtype=torch.long, device=device)) # position embeddings of shape (t, n_embd)
