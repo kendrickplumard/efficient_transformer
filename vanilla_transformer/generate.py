@@ -12,58 +12,62 @@ import torch
 
 from contextlib import nullcontext
 
-from efficient_transformer_v1.config.train_config import TRAIN_CONFIG
-from efficient_transformer_v1.model import AnyModalMirasol, AnyModalMirasolConfig
+from vanilla_transformer.model import GPT, GPTConfig
+from vanilla_transformer.train_utils import TRAIN_CONFIG
 
 # -----------------------------------------------------------------------------
-train_config = TRAIN_CONFIG()
-init_from = 'resume'
+# Initialize argument parser
 parser = argparse.ArgumentParser()
+
+# Add arguments
+parser.add_argument("--init_from", type=str, default='resume', help="Initialization method")
 parser.add_argument("--out_dir", type=str, default="out", help="Path to the output directory")
+parser.add_argument("--ckpt_filename", type=str, default='gpt.pt', help="Checkpoint filename")
 parser.add_argument("--start", 
                     type=str, 
-                    default="ANGELO:\nAnd cowards it be strawn to my bed,\nAnd thrust the gates of my threats,\nBecause he that ale away, and hang'd\nAn one with him.\n\nDUKE VINCENTIO:\nI thank your eyes against it.\n\nDUKE VINCENTIO:\nThen \
-                            will answer him to save the malm:\nAnd what have you tyrannous shall do this?\n\nDUKE VINCENTIO:\nIf you have done evils of all disposition\nTo end his power, the day of thrust for a common men\nThat I leave, to fight \
-                            with over-liking\nHasting in a roseman.ANGELO:\nAnd cowards it be strawn to my bed,\nAnd thrust the gates of my threats,\nBecause he that ale away, and hang'd\nAn one with him.\n\nDUKE VINCENTIO:\nI thank your eyes against \
-                            it.\n\nDUKE VINCENTIO:\nThen will answer him to save the malm:\nAnd what have you tyrannous shall do this?\n\nDUKE VINCENTIO:\nIf you have done evils of all disposition\nTo end his power, the day of thrust for a common \
-                            men\nThat I leave, to fight with over-liking\nHasting in a roseman.", # "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
+                    default="\n", # "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
                     help="Starting tokens for generation")
-parser.add_argument("--ckpt_filename", type=str, default='anymodal_mirasol.pt', help="Checkpoint filename")
 parser.add_argument("--num_samples", type=int, default=10, help="Number of samples to generate")
 parser.add_argument("--max_new_tokens", type=int, default=500, help="Maximum number of new tokens to generate")
 parser.add_argument("--temperature", type=float, default=0.8, help="Temperature for generation")
 parser.add_argument("--top_k", type=int, default=8, help="Value for top-k sampling")
+parser.add_argument("--seed", type=int, default=42, help="Random seed")
+parser.add_argument("--device", type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help="Device to use (e.g., 'cpu', 'cuda', 'cuda:0', 'cuda:1')")
+parser.add_argument("--dtype", type=str, default='bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16', help="Data type ('float32', 'bfloat16', or 'float16')")
+parser.add_argument("--compile", action='store_true', help="Use PyTorch 2.0 to compile the model (optional)")
 
+# Parse arguments
 args = parser.parse_args()
 
+# Update variables with parsed arguments
+init_from = args.init_from
 out_dir = args.out_dir
-start = args.start 
 ckpt_filename = args.ckpt_filename
+start = args.start
 num_samples = args.num_samples
-max_new_tokens = args.max_new_tokens 
+max_new_tokens = args.max_new_tokens
 temperature = args.temperature
 top_k = args.top_k
-seed = 42
-device = 'cuda' if torch.cuda.is_available() else 'cpu' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-compile = True # use PyTorch 2.0 to compile the model to be faster
-# exec(open('configurator.py').read()) # overrides from command line or config file
+seed = args.seed
+device = args.device
+dtype = args.dtype
+compile = args.compile
 # -----------------------------------------------------------------------------
 
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+torch.backends.cuda.matmul.allow_tf32 = True 
+torch.backends.cudnn.allow_tf32 = True 
+train_config = TRAIN_CONFIG()
+device_type = 'cuda' if 'cuda' in device else 'cpu' 
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-
+# model
 ckpt_path = os.path.join(out_dir, ckpt_filename)
 checkpoint = torch.load(ckpt_path, map_location=device)
-gptconf = AnyModalMirasolConfig(**checkpoint['model_args'])
-print(gptconf)
-model = AnyModalMirasol(gptconf)
+gptconf = GPTConfig(**checkpoint['model_args']) # Assuming GPTConfig is defined
+model = GPT(gptconf) # Assuming GPT is defined
 state_dict = checkpoint['model']
 unwanted_prefix = '_orig_mod.'
 for k,v in list(state_dict.items()):
@@ -74,13 +78,12 @@ if train_config.use_schedule_free_lr:
     optimizer = schedulefree.AdamWScheduleFree(model.parameters()) # they update warmup counter every optimizer step
     optimizer.load_state_dict(checkpoint['optimizer'])
 
-
 model.eval()
 model.to(device)
 if train_config.use_schedule_free_lr:
   optimizer.eval()
 if compile:
-    model = torch.compile(model) # requires PyTorch 2.0 (optional)
+    model = torch.compile(model) 
 
 # look for the meta pickle in case it is available in the dataset folder
 load_meta = True
@@ -106,10 +109,7 @@ else:
 if start.startswith('FILE:'):
     with open(start[5:], 'r', encoding='utf-8') as f:
         start = f.read()
-print("start token:", start)
 start_ids = encode(start)
-print("start token length:", len(start_ids))
-assert len(start_ids) > gptconf.n_groups * gptconf.latent_size[0], "minimal length in the input length"
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]) # None: add a dimension, ...: remaining dim of an array - include other dim of the original array
 
 # run generation

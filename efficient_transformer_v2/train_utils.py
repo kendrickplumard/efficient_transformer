@@ -2,32 +2,33 @@ import math
 import numpy as np
 import os
 import torch
-import torch.nn as nn
 import wandb
 
 from contextlib import nullcontext
 from torch.utils.data import Dataset
-from typing import Dict, Union, Optional
+from typing import Dict, Union, List
 
-from efficient_transformer_v1.config.train_config import TRAIN_CONFIG
-from efficient_transformer_v1.model import AnyModalMirasol, AnyModalMirasolConfig
+from efficient_transformer_v2.config.train_config import TRAIN_CONFIG
+from efficient_transformer_v2.model import ConditionalTF, ConditionalTFConfig
+
 
 @torch.no_grad()
-def writeLogs(model: torch.nn.Module, 
-              activations: Dict[str, torch.Tensor], 
-              losses: Dict, iter: int, lr: float,  
-              optimizer: torch.optim.Optimizer, 
-              train_config: TRAIN_CONFIG, 
+def writeLogs(model: torch.nn.Module,
+              activations: Dict[str, torch.Tensor],
+              losses: Dict, iter: int, lrs: List[float],
+              optimizers: List[torch.optim.Optimizer],
+              train_config: TRAIN_CONFIG,
               model_args: Dict) -> None:
   
+  lr = lrs[0]
+  lr_sampling_predictor = lrs[1]
+
   wandb.log({
       'iter': iter,
-      'total_train_loss': losses['train_loss']['total'],
-      'cross_entropy_train_loss': losses['train_loss']['cross_entropy'],
-      'latent_train_loss': losses['train_loss']['latent_causal_modeling'],
+      'train_loss': losses['train_loss'],
       'val_loss': losses['val_loss'],
       })
-  
+
   for module, activation in activations.items():
     wandb.log({
         f'activations/{module}_mean': activation.mean().item(),
@@ -36,12 +37,17 @@ def writeLogs(model: torch.nn.Module,
     })
 
   if train_config.use_schedule_free_lr:
-    k = optimizer.param_groups[0]['k']
-    warmup_steps = optimizer.param_groups[0]['warmup_steps']
+    k = optimizers[0].param_groups[0]['k']
+    warmup_steps = optimizers[0].param_groups[0]['warmup_steps']
     sched = (k + 1) / warmup_steps if (k < warmup_steps) else 1.0
-    lr = optimizer.param_groups[0]['lr']*sched*math.sqrt(1-optimizer.param_groups[0]['betas'][1]**(k+1))
+    lr = optimizers[0].param_groups[0]['lr']*sched*math.sqrt(1-optimizers[0].param_groups[0]['betas'][1]**(k+1))
 
-  special_weights = ['pos_embd_layers', 'wte', 'first_group_tokens_for_upsampling', 'shared_soft_experts', 'mem_token']
+    k = optimizers[1].param_groups[0]['k']
+    warmup_steps = optimizers[1].param_groups[0]['warmup_steps']
+    sched = (k + 1) / warmup_steps if (k < warmup_steps) else 1.0
+    lr_sampling_predictor = optimizers[1].param_groups[0]['lr']*sched*math.sqrt(1-optimizers[1].param_groups[0]['betas'][1]**(k+1))
+
+  special_weights = ['pos_embd_layers', 'wte', 'first_group_tokens_for_upsampling', 'shared_soft_experts', 'mem_token', 'sampling_predictor']
   for pn, p in model.named_parameters():
     wandb.log({
         f'params/{pn}_mean': p.data.mean().item(),
@@ -79,6 +85,16 @@ def writeLogs(model: torch.nn.Module,
               f'effective_update_over_param_data/{pn}_std': ((((lr/p.shape[0])*p.grad).std())/p.data.std()).log10().item(),
               f'effective_update_over_param_data/{pn}_norm2': ((((lr/p.shape[0])*p.grad).norm(2).mean())/p.data.norm(2).mean()).log10().item(),
             })
+          elif 'sampling_predictor' in pn:
+            wandb.log({
+              f'lr/{pn}': lr_sampling_predictor/p.shape[1],
+              f'effective_update/{pn}_mean': ((lr_sampling_predictor/p.shape[1])*p.grad).mean().item(),
+              f'effective_update/{pn}_std': ((lr_sampling_predictor/p.shape[1])*p.grad).std().log10().item(),
+              f'effective_update/{pn}_norm2': ((lr_sampling_predictor/p.shape[1])*p.grad).norm(2).mean().log10().item(),
+              f'effective_update_over_param_data/{pn}_mean': ((((lr_sampling_predictor/p.shape[1])*p.grad).mean())/p.data.mean()).item(),
+              f'effective_update_over_param_data/{pn}_std': ((((lr_sampling_predictor/p.shape[1])*p.grad).std())/p.data.std()).log10().item(),
+              f'effective_update_over_param_data/{pn}_norm2': ((((lr_sampling_predictor/p.shape[1])*p.grad).norm(2).mean())/p.data.norm(2).mean()).log10().item(),
+            })
           else:
             wandb.log({
               f'lr/{pn}': lr,
@@ -98,33 +114,47 @@ def writeLogs(model: torch.nn.Module,
             f'effective_update_over_param_data/{pn}_mean': ((lr*p.grad).mean()/p.data.mean()).item(),
             f'effective_update_over_param_data/{pn}_std': ((lr*p.grad).std()/p.data.std()).log10().item(),
             f'effective_update_over_param_data/{pn}_norm2': ((lr*p.grad).norm(2).mean()/p.data.norm(2).mean()).log10().item(),
-          })  
-      else: # cases : schedule free lr or no muP 
-        wandb.log({
-          f'lr': lr,
-          f'effective_update/{pn}_mean': (lr*p.grad).mean().item(),
-          f'effective_update/{pn}_std': (lr*p.grad).std().log10().item(),
-          f'effective_update/{pn}_norm2': (lr*p.grad).norm(2).mean().log10().item(),
-          f'effective_update_over_param_data/{pn}_mean': ((lr*p.grad).mean()/p.data.mean()).item(),
-          f'effective_update_over_param_data/{pn}_std': ((lr*p.grad).std()/p.data.std()).log10().item(),
-          f'effective_update_over_param_data/{pn}_norm2': ((lr*p.grad).norm(2).mean()/p.data.norm(2).mean()).log10().item(),
-        })      
-  
+          })
+      else: # cases : schedule free lr or no muP
+        if 'sampling_predictor' not in pn:
+          wandb.log({
+            f'lr': lr,
+            f'effective_update/{pn}_mean': (lr*p.grad).mean().item(),
+            f'effective_update/{pn}_std': (lr*p.grad).std().log10().item(),
+            f'effective_update/{pn}_norm2': (lr*p.grad).norm(2).mean().log10().item(),
+            f'effective_update_over_param_data/{pn}_mean': ((lr*p.grad).mean()/p.data.mean()).item(),
+            f'effective_update_over_param_data/{pn}_std': ((lr*p.grad).std()/p.data.std()).log10().item(),
+            f'effective_update_over_param_data/{pn}_norm2': ((lr*p.grad).norm(2).mean()/p.data.norm(2).mean()).log10().item(),
+          })
+        else:
+          wandb.log({
+            f'lr': lr_sampling_predictor,
+            f'effective_update/{pn}_mean': (lr_sampling_predictor*p.grad).mean().item(),
+            f'effective_update/{pn}_std': (lr_sampling_predictor*p.grad).std().log10().item(),
+            f'effective_update/{pn}_norm2': (lr_sampling_predictor*p.grad).norm(2).mean().log10().item(),
+            f'effective_update_over_param_data/{pn}_mean': ((lr_sampling_predictor*p.grad).mean()/p.data.mean()).item(),
+            f'effective_update_over_param_data/{pn}_std': ((lr_sampling_predictor*p.grad).std()/p.data.std()).log10().item(),
+            f'effective_update_over_param_data/{pn}_norm2': ((lr_sampling_predictor*p.grad).norm(2).mean()/p.data.norm(2).mean()).log10().item(),
+          })
+
   activations.clear()
 
 @torch.no_grad()
-def saveCkpt(best_val_loss: float, 
+def saveCkpt(best_val_loss: Dict[str, float], 
              model: torch.nn.Module, 
-             model_args: Dict, iter: int, 
-             config: Dict, filepath: str, 
-             optimizer: torch.optim.Optimizer, 
-             use_schedule_free_lr: Optional[bool] = False) -> float:
-    
+             model_args: Dict, 
+             iter: int, 
+             config: Dict, 
+             filepath: str, 
+             optimizers: List[torch.optim.Optimizer], 
+             use_schedule_free_lr: bool = False) -> float:
     if use_schedule_free_lr:
-      optimizer.eval()
+      for optimizer in optimizers:
+        optimizer.eval()
     checkpoint = {
         'model': model.state_dict(),
-        'optimizer': optimizer.state_dict(),
+        'optimizer': optimizers[0].state_dict(),
+        'optimizer_sampling_predictor': optimizers[1].state_dict(),
         'model_args': model_args,
         'iter_num': iter,
         'best_val_loss': best_val_loss,
@@ -137,39 +167,32 @@ def saveCkpt(best_val_loss: float,
         )
     print(f"Saved to {file_path}")
     if use_schedule_free_lr:
-      optimizer.train()
+      for optimizer in optimizers:
+        optimizer.train()
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_loss(model: torch.nn.Module, 
-                  val_dataloader: torch.utils.data.DataLoader, 
-                  ctx: Union[torch.amp.autocast, nullcontext], 
-                  device: str, 
-                  optimizer: Optional[torch.optim.Optimizer] = None, 
-                  use_schedule_free_lr: Optional[bool] = False) -> float:
-    
+def estimate_loss(model: torch.nn.Module, val_dataloader: torch.utils.data.DataLoader, ctx: Union[torch.amp.autocast, nullcontext], device: str, optimizers: List[torch.optim.Optimizer] = [None, None], use_schedule_free_lr: bool = False) -> float:
     model.eval()
     if use_schedule_free_lr:
-      assert optimizer != None, "please provide the optimizer when you use estimate_loss with schedule free lr"
-      optimizer.eval()
-    losses = torch.zeros(len(val_dataloader))
+      assert optimizers != [None, None], "please provide the optimizer when you use estimate_loss with schedule free lr"
+      for optimizer in optimizers:
+        optimizer.eval()
+    CE_loss = torch.zeros(len(val_dataloader))
+    sampling_predictors_mean_loss = torch.zeros(len(val_dataloader))
     for step, (X, y) in enumerate(val_dataloader):
       X, Y = X.to(device), y.to(device)
       with ctx: # In these regions, ops run in an op-specific dtype chosen by autocast # Backward passes under autocast are not recommended. Backward ops run in the same type that autocast used for corresponding forward ops.
-        _, loss = model(X, Y) # va falloir degager loss de forward pass
-        losses[step] = loss["cross_entropy"].item()
+        _, losses = model(X, Y) # va falloir degager loss de forward pass
+        CE_loss[step] = losses['CE'].item()
+        sampling_predictors_mean_loss[step] = torch.tensor([losses[key].item() for key in losses if key != 'CE']).mean()
     model.train()
     if use_schedule_free_lr:
-      optimizer.train()
-    return losses.mean()
+      for optimizer in optimizers:
+        optimizer.train()
+    return {'CE': CE_loss.mean(), 'sampling_predictors_mean_loss': sampling_predictors_mean_loss.mean()}
 
-def buildModel(init_from: str, 
-               device: str, 
-               out_dir: str, 
-               default_model_args: Dict, 
-               ckpt_filename: str, 
-               meta_vocab_size: Optional[int] = None):
-  
+def buildModel(init_from: str, device: str, meta_vocab_size: int, out_dir: str, default_model_args: Dict, ckpt_filename: str = None):
   if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -178,11 +201,11 @@ def buildModel(init_from: str,
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     default_model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     model_args = default_model_args
-    gptconf = AnyModalMirasolConfig(**model_args)
-    model = AnyModalMirasol(gptconf)
+    gptconf = ConditionalTFConfig(**model_args)
+    model = ConditionalTF(gptconf)
     # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
     iter = 0
-    best_val_loss = 1e9
+    best_val_loss = {'CE': 1e9}
     checkpoint = None
   elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
@@ -193,11 +216,11 @@ def buildModel(init_from: str,
     model_args = default_model_args
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in model_args:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
     # create the model
-    gptconf = AnyModalMirasolConfig(**model_args)
-    model = AnyModalMirasol(gptconf)
+    gptconf = ConditionalTFConfig(**model_args)
+    model = ConditionalTF(gptconf)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -222,7 +245,7 @@ def cos_schedule(current_step: int, warmup_iters: int, decay_iters: int, min_val
   # 3) in between, use cosine decay down to min_value # count steps from the initiation of the cos decay
   decay_ratio = (current_step - warmup_iters) / (decay_iters - warmup_iters)
   assert 0.0 <= decay_ratio <= 1.0, "something wrong with the cosine schedule config"
-  coeff = (1/2) * (1.0 + math.cos(math.pi * decay_ratio)) 
+  coeff = (1/2) * (1.0 + math.cos(math.pi * decay_ratio))
   return max_value + coeff * (min_value - max_value)
 
 
@@ -238,27 +261,28 @@ def linear_schedule(current_step: int, warmup_iters: int, decay_iters: int, min_
   coeff = (current_step - warmup_iters) / (decay_iters - warmup_iters) # starts with 0 and ends with 1
   return max_value + coeff * (min_value - max_value)
 
-def calc_lr(train_config: TRAIN_CONFIG, current_step: int, max_iters: int):
+def calc_lr(train_config: TRAIN_CONFIG, current_step: int, max_iters: int, position: int = 0):
   linear_schedule_kwargs = {
-    "current_step": current_step, 
-    "warmup_iters": train_config.warmup_iters * max_iters, 
-    "decay_iters": train_config.lr_decay_iters * max_iters, 
-    "min_value": train_config.min_lr, 
-    "max_value": train_config.learning_rate
+    "current_step": current_step,
+    "warmup_iters": train_config.warmup_iters[position] * max_iters,
+    "decay_iters": train_config.lr_decay_iters[position] * max_iters,
+    "min_value": train_config.min_lr[position],
+    "max_value": train_config.learning_rate[position]
   }
-  if train_config.lr_schedule == 'constant':
-    return train_config.learning_rate
-  elif train_config.lr_schedule == 'cos_schedule':
+  if train_config.lr_schedule[position] == 'constant':
+    return train_config.learning_rate[position]
+  elif train_config.lr_schedule[position] == 'cos_schedule':
     return cos_schedule(**linear_schedule_kwargs)
-  elif train_config.lr_schedule == 'linear_schedule':
+  elif train_config.lr_schedule[position] == 'linear_schedule':
     return linear_schedule(**linear_schedule_kwargs)
   else:
     raise ValueError("You must set a lr schedule between constant/cos_schedule/linear_schedule")
 
-
-# Note: We're using the pin_memory=True parameter in the create_dataloaders() function to speed up computation. pin_memory=True avoids unnecessary
-# copying of memory between the CPU and GPU memory by "pinning" examples that have been seen before. Though the benefits of this will likely be seen
-# with larger dataset sizes
+import torch
+from torch.utils.data import Dataset
+import tiktoken
+import os
+import numpy as np
 
 def buildDataBlock(train_data: np.ndarray, block_size: int, limitSizeTo: int = None, stepSize: int = 1):
   maxElm = (min(limitSizeTo, len(train_data) - block_size)) if limitSizeTo else  (len(train_data) - block_size)
@@ -278,4 +302,3 @@ class CustomDataset(Dataset):
   def __getitem__(self, index: int):
     X, y = self.data_block[0], self.data_block[1]
     return X[index], y[index]
-

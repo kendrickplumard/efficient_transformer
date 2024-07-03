@@ -2,15 +2,14 @@ import math
 import numpy as np
 import os
 import torch
-import torch.nn as nn
 import wandb
 
 from contextlib import nullcontext
 from torch.utils.data import Dataset
 from typing import Dict, Union, Optional
 
-from efficient_transformer_v1.config.train_config import TRAIN_CONFIG
-from efficient_transformer_v1.model import AnyModalMirasol, AnyModalMirasolConfig
+from vanilla_transformer.config.train_config import TRAIN_CONFIG
+from vanilla_transformer.model import GPT, GPTConfig
 
 @torch.no_grad()
 def writeLogs(model: torch.nn.Module, 
@@ -22,9 +21,7 @@ def writeLogs(model: torch.nn.Module,
   
   wandb.log({
       'iter': iter,
-      'total_train_loss': losses['train_loss']['total'],
-      'cross_entropy_train_loss': losses['train_loss']['cross_entropy'],
-      'latent_train_loss': losses['train_loss']['latent_causal_modeling'],
+      'train_loss': losses['train_loss'],
       'val_loss': losses['val_loss'],
       })
   
@@ -155,9 +152,9 @@ def estimate_loss(model: torch.nn.Module,
     losses = torch.zeros(len(val_dataloader))
     for step, (X, y) in enumerate(val_dataloader):
       X, Y = X.to(device), y.to(device)
-      with ctx: # In these regions, ops run in an op-specific dtype chosen by autocast # Backward passes under autocast are not recommended. Backward ops run in the same type that autocast used for corresponding forward ops.
-        _, loss = model(X, Y) # va falloir degager loss de forward pass
-        losses[step] = loss["cross_entropy"].item()
+      with ctx: 
+        _, loss = model(X, Y) 
+        losses[step] = loss.item()
     model.train()
     if use_schedule_free_lr:
       optimizer.train()
@@ -167,7 +164,7 @@ def buildModel(init_from: str,
                device: str, 
                out_dir: str, 
                default_model_args: Dict, 
-               ckpt_filename: str, 
+               ckpt_filename: str,
                meta_vocab_size: Optional[int] = None):
   
   if init_from == 'scratch':
@@ -178,8 +175,8 @@ def buildModel(init_from: str,
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     default_model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     model_args = default_model_args
-    gptconf = AnyModalMirasolConfig(**model_args)
-    model = AnyModalMirasol(gptconf)
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf)
     # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
     iter = 0
     best_val_loss = 1e9
@@ -193,11 +190,11 @@ def buildModel(init_from: str,
     model_args = default_model_args
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in model_args:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
     # create the model
-    gptconf = AnyModalMirasolConfig(**model_args)
-    model = AnyModalMirasol(gptconf)
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -262,7 +259,7 @@ def calc_lr(train_config: TRAIN_CONFIG, current_step: int, max_iters: int):
 
 def buildDataBlock(train_data: np.ndarray, block_size: int, limitSizeTo: int = None, stepSize: int = 1):
   maxElm = (min(limitSizeTo, len(train_data) - block_size)) if limitSizeTo else  (len(train_data) - block_size)
-  X = [torch.from_numpy((train_data[i:i+block_size]).astype(np.int64)) for i in range(0, maxElm, stepSize)] # rajouter un char end of sentence plutot
+  X = [torch.from_numpy((train_data[i:i+block_size]).astype(np.int64)) for i in range(0, maxElm, stepSize)] 
   y = [torch.from_numpy((train_data[i+1:i+1+block_size]).astype(np.int64)) for i in range(0, maxElm, stepSize)]
   return X, y
 
