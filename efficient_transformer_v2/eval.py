@@ -1,5 +1,7 @@
 ### test model
 
+### test model
+
 import argparse
 import numpy as np
 import os
@@ -10,25 +12,17 @@ from contextlib import nullcontext
 
 from torch.utils.data import DataLoader
 
-from efficient_transformer_v1.config.train_config import TRAIN_CONFIG
-from efficient_transformer_v1.model import AnyModalMirasol, AnyModalMirasolConfig
-from efficient_transformer_v1.train_utils import CustomDataset, estimate_loss
+from efficient_transformer_v2.config.train_config import TRAIN_CONFIG
+from efficient_transformer_v2.model import ConditionalTF, ConditionalTFConfig
+from efficient_transformer_v2.train_utils import CustomDataset, estimate_loss
 
 torch._dynamo.config.suppress_errors = True
 
-train_config = TRAIN_CONFIG()
+train_config = TRAIN_CONFIG() # use the default train config
 
-parser = argparse.ArgumentParser()
-# Add argument for checkpoint filename
-parser.add_argument("--ckpt_filename", type=str, 
-                    help="Name of the checkpoint file to load.", 
-                    default='anymodal_mirasol.pt')
-# Parse the arguments
-args = parser.parse_args()
 
 # -----------------------------------------------------------------------------
-# Access the checkpoint filename from args
-ckpt_filename = args.ckpt_filename 
+ckpt_filename = 'conditional_tf.pt'
 device = 'cuda' if torch.cuda.is_available() else 'cpu' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = True # use PyTorch 2.0 to compile the model to be faster
@@ -47,30 +41,33 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # model
 ckpt_path = os.path.join(train_config.out_dir, ckpt_filename)
 checkpoint = torch.load(ckpt_path, map_location=device)
-gptconf = AnyModalMirasolConfig(**checkpoint['model_args'])
-model = AnyModalMirasol(gptconf)
+gptconf = ConditionalTFConfig(**checkpoint['model_args'])
+model = ConditionalTF(gptconf)
 state_dict = checkpoint['model']
 unwanted_prefix = '_orig_mod.'
 for k,v in list(state_dict.items()):
     if k.startswith(unwanted_prefix):
         state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
 model.load_state_dict(state_dict)
-if train_config.use_schedule_free_lr:
-    optimizer = schedulefree.AdamWScheduleFree(model.parameters()) # they update warmup counter every optimizer step
-    optimizer.load_state_dict(checkpoint['optimizer'])
 
+if train_config.use_schedule_free_lr:
+  optimizer = schedulefree.AdamWScheduleFree([p for pn, p in model.named_parameters() if 'sampling_predictor' not in pn]) 
+  optimizer_sampling_predictor = schedulefree.AdamWScheduleFree([p for pn, p in model.named_parameters() if 'sampling_predictor' in pn]) 
+  optimizer.load_state_dict(checkpoint['optimizer'])
+  optimizer_sampling_predictor.load_state_dict(checkpoint['optimizer_sampling_predictor'])
 
 model.eval()
 model.to(device)
 if train_config.use_schedule_free_lr:
   optimizer.eval()
+  optimizer_sampling_predictor.eval()
 if compile:
     model = torch.compile(model) # requires PyTorch 2.0 (optional)
 
 # load dataset
 test_dataset = CustomDataset(os.path.join(train_config.dataset, 'test.bin'),
-                             train_config.model_config.block_size, train_config.restrict_eval_iters,
-                             train_config.step_size_eval)
+                             train_config.model_config.block_size, 
+                             train_config.restrict_eval_iters)
 test_dataloader = DataLoader(dataset = test_dataset,
                               batch_size = 2 * train_config.batch_size, # could allow double the train bs, keep no grad in eval mode
                               num_workers = os.cpu_count(),

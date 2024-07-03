@@ -1,6 +1,6 @@
-# efficient_transformer
+# efficient_transformer_v1
 
-## Core Hypothesis: Composition is Key
+## Core Hypothesis: Composition brings generalization
 
 We are using this repository to collect various experiments on more efficient transformers. My primary objective is the development of planning algorithms combined with LLMs, but before getting there, it will be necessary to find a way to reduce the inference cost of these models. 
 
@@ -14,52 +14,42 @@ To compose the information from the experts to the central module to enrich its 
 
 ## Inspiration from Recent Research - Preliminary Explorations and Architectural Tweaks
 
-Before embarking on this composition phase, we thought it was more relevant to optimize the basic architecture of each expert and the central module as much as possible. we started with [Mirasol](https://arxiv.org/pdf/2311.05698.pdf), which provides excellent results for its size. However, we moved towards a more "any modal" version without the two separate audio/video and text pathways. To further increase computational efficiency, we introduced a notion of groups in my sequence of tokens, and each group will provide K latent embeddings, and then we upsample somewhat like in [Hierarchical Perceiver](https://arxiv.org/pdf/2202.10890.pdf). To gradually reduce the input size, we explored a Perceiver encoder and a Transformer encoder from which we retrieve the last K tokens after processing, as in Mirasol. The Perceiver encoder is faster than the Transformer but performs less well than the Transformer encoder, similar to what was observed in [Mirasol](https://arxiv.org/pdf/2202.07765.pdf). we continued with the Transformer.
+Before embarking on this composition phase, we thought it was more relevant to optimize the basic architecture of each expert and the central module as much as possible. we started with [Mirasol](https://arxiv.org/pdf/2311.05698.pdf), which provides excellent results for its size. However, we moved towards a more "any modal" version without the two separate audio/video and text pathways. To further increase computational efficiency, we considered a notion of groups in the sequence of tokens, and each group will provide K latent embeddings, then a latent block and we finish by upsampling somewhat like in [Hierarchical Perceiver](https://arxiv.org/pdf/2202.10890.pdf). To gradually reduce the input size, we explored a Perceiver encoder and a Transformer encoder from which we retrieve the last K tokens after processing, as in Mirasol. 
 
-In the end, we end up with an encoder block (which consists of several series of input size reductions and processing of this new sequence) and a latent block, the most important one that will take the vast majority of the processing, and then we upsample in a series of layers called decoders. In practice, we add positional embeddings in each encoder layer after compression and in each decoder layer after upsampling, which seems to have helped. These layers are shared between the encoder and decoder.
+In the end, we end up with:
+- a serie of encoder blocks which consists of several series of sequence reduction and processing of these new sequences through transformer layers which means for an  input length L we build g groups of length L/g then compress each group separately into latent of size K which gives us g groups of seq length K. After compression we further process in the encoder block by alternating between a layer of local and a layer of global processing or follow a serie of local processing by a serie of global processing according to the config. Local processing is done between latent tokens of the same group. After an encoder layer, we discard the group separation. 
+- a serie of latent blocks, the most important one which takes the vast majority of the computation. It uses global layers of transformers. We eventually consider the insertion of a latent loss here (e.g [Mirasol](https://arxiv.org/pdf/2311.05698)) or the use of [Denseformer](https://arxiv.org/pdf/2402.02622) which is not that costly in memory since we have a largely reduce sequence length in these blocks. 
+- a serie of decoder blocks which will upsample until we get back to the original sentence size. We have the same number of encoder and decoder blocks and they are structured in the same way with local and global processing. For upsampling in the decoder, we opted for a replication of the nearest previous group until the appropriate size was reached once the current group sequence was added. See the code for more information. This approach generally performs well, but the lack of contextual understanding due to simple replication without taking position into account can limit expressiveness. After discovering the paper on [Hourglass Transformers](https://arxiv.org/pdf/2110.13711), which also investigated a U-net architecture for transformers, we also considered a variant of their upsampling method via attention.
 
-Moreover, the processing of each block is done through a transformer. To increase expressiveness while further reducing the computational cost, we postulated that for a certain size limit of the sequence in the latent block, it is probably more interesting to have several channels of the same sequence (i.e., several different q, k, v) rather than to have a very long sequence in the central block that separates encoder and decoder, the latent block. Notably, if we reduce the initial latent size from K to K/m, we go in the attention module from K^2 to s * (K/m)^2 with s the number of additional q, k, v. The paper closest to this idea is probably Noam Shazeer's on [talking heads attention](https://arxiv.org/pdf/2003.02436.pdf), with the difference that here we have s different linear layers that will provide me with s query, s key and s value vectors. In other words, for each si (i ranging from 1 to s) we have a qi, a ki and a vi that will interact on several heads according to the self-attention module of the vanilla transformer. They can be likened to experts who will extract totally different information on the same sequence. we preserve the s different features at the output of the attention module in a single vector and each will go through a dedicated MLP and then we merge them by performing a convex combination of the s different features with the coefficients coming from a softmax applied to them, a bit like in the [SoftMoE](https://arxiv.org/pdf/2308.00951.pdf). On the other hand, the dimension of the MLPs applied to each of the s experts is a multiple of the dimension of a vanilla MLP divided by s. The number of multiples is a hyperparameter. Merging via max and mean of the features was also considered, but according to the first experiments, this performed less well than the chosen version, which is logical given the absence of non-linearities, but in return, we spend more computation time.
+In practice, we add positional embeddings in each encoder layer after compression and in each decoder layer after upsampling, which seems to have helped. These layers are shared between the encoder and decoder.
+
+To increase expressiveness while further reducing the computational cost, we postulated that for a certain size limit of the sequence in the latent block, it is probably more interesting to have several channels of the same sequence (i.e., several different q, k, v) rather than to have a very long sequence in the central block that separates encoder and decoder, the latent block. Notably, if we reduce the original latent size from K to K/m, we go in the attention module from K^2 to s * (K/m)^2 with s the number of additional q, k, v. The paper closest to this idea is probably Noam Shazeer's on [talking heads attention](https://arxiv.org/pdf/2003.02436.pdf), with the difference that here we have s different linear layers that will provide me with s query, s key and s value vectors. In other words, for each si (i ranging from 1 to s) we have a qi, a ki and a vi that will interact on several heads according to the self-attention module of the vanilla transformer. They can be likened to experts who will extract totally different information on the same sequence. we preserve the s different features at the output of the attention module in a single vector and each will go through a dedicated MLP and then we merge them by performing a convex combination of the s different features with the coefficients coming from a softmax applied to them, a bit like in the [SoftMoE](https://arxiv.org/pdf/2308.00951.pdf). On the other hand, the dimension of the MLPs applied to each of the s experts is a multiple of the dimension of a vanilla MLP divided by s. The number of multiples is a hyperparameter. Merging via max and mean of the features was also considered, but according to the first experiments, this performed less well than the chosen version, which is logical given the absence of non-linearities, but in return, we spend more computation time.
 
 It is conceivable that the longer the sequence, the more information there will be to extract. The same goes for the size of the model, the larger it is, the denser and richer the features will be and the more we will potentially gain by doing so. A variant allowing to share part of the MLPs while using the same number of qkv and specialized MLPs was also studied following [DeepSpeek MoE](https://arxiv.org/pdf/2201.05596). This allows, among other things, to dedicate a space to store the information common to the experts and thus to increase the specialization of the MLPs associated with each of them.
 
-For upsampling in the decoder, we opted for a replication of the nearest previous group until the appropriate size was reached once the current group sequence was added. See the code for more information. This approach generally performs well, but the lack of contextual understanding due to simple replication without taking position into account can limit expressiveness. After discovering the paper on [Hourglass Transformers](https://arxiv.org/pdf/2110.13711), which also investigated a U-net architecture for transformers, we also investigated their method of upsampling via attention.
 
 ## Experimental Setup
 
-The experiments were carried out with a base model of 19.55M without soft experts and 20.48M (n_layer=26, n_head=8, n_embd=256) for a vanilla transformer following the architecture used in the [nanoGPT repository](https://github.com/karpathy/nanoGPT). It was the best we could do to be able to iterate easily and assess the impact of different tweaks on the architecture since we am working on Google Colab. Similarly, the lr schedule has not been extensively tuned. For both architectures, we considered an lr max of 4.8e-4 and a final lr of 10% of this value. [A linear schedule was used which provides same performances as the cosine schedule which does nothing magical](https://arxiv.org/pdf/2310.07831) for which we warmup for 50% of the dataset and decay until 85%. Overall, all experiments were performed for each of the two upsamplers, and generally, the attention upsampler scales better with the number of parameters but consumes more computation time, which is to be expected.
-
-We consider the shakespear_char dataset and split it into 80% for training, 10% for validation and 10 for test. Following the paper about [Hourglass Transformers](https://arxiv.org/pdf/2110.13711), we evaluate our model on the validation set splitting it into overlapping sequences of size l=769, with a step size of 32 and calculate the val loss over the last 32 tokens. 
 
 ## Key Observations
 
 **To summarize the results:**
-
-* The more experts there are, the better the results are up to a certain point (generally until at least 6 you can expect good perf/compute).
-* Increasing the size of MLPs also seems to help, as does increasing the size of the latent vectors in the encoders or in the latent space.
-* Since large seq lengths in the encoder blocks or the latent blocks is better, we can allow much larger ones with the repeat upsampling which take less time to compute than the attention version.
-* Increasing the frequency of layers with soft experts also seems to help in the context of attention upsampling.
-* Sharing MLPs between experts in addition to their specialized MLP associated with them instead of increasing the number of qkv and the number of specialized MLPs guarantees similar performance in terms of log-likelihood to the classic variant while being faster since there is less attention to compute, regardless of the total number of experts and the size of the sequence in the latent space. So generally the best performing way (log-likelihood/compute) to use the attention upsampling is to combine it with some shared experts.
-* Using [Denseformer](https://arxiv.org/pdf/2402.02622) in the latent blocks only helps for attention upsampling.
-* The latent reconstruction loss employed in [Mirasol](https://arxiv.org/pdf/2311.05698) does not help here. It is difficult to say whether this is due to the radically different scale (20M vs 3B) or if it is due to the modality (Mirasol was a VLM while we try just an LM).
+* 
 
 
-**Plot:**
-
-For illustration purpose, we shared bellow a fig with some of the best configs compared to the baseline transformer. The transformer was trained for one epoch, while variants of our architecture were trained for two epochs since they are substantially faster. All models lr were fully decayed (same schedule as stated above, only the amount of data seen differs). 
-We would like to emphasize that these are results for the chosen lr schedule and on the shakespear_char dataset. More experiments on diverse datasets including evals on downstream tasks as well as tuning the hp and scaling the models are needed to have the full picture [as demonstrated here](https://arxiv.org/pdf/2207.10551). 
-
-![Best Models](assets/plots/best_models.png)
+**Concrete examples of good configs:**
 
 
-We can observe that models with attention upsampling take more time than those using the repeat upsampling as expected. Although they have similar performance at the end of the repeat upsampling models trainings. So if one is looking purely for speed, the repeat upsampling version offers generally a good tradeoff. Nevertheless, in most experiences made we still noticed that the attention version scales better with compute. Both models are, when configure correctly, a lot faster than the vanilla transformer architecture while achieving the same validation loss (at least 50% flops reduction at inference when we consider the attention upsampling and even more with the repeat version). 
-
-You can find loss curve progression for some of the experiences made in the **assets folder**. 
+**Update:**
+* 
 
 ## TODO
 
-* Need to rebuild muP, arch has evolved quite a bit. The current implementation is obsolete....
-* Add the transformer model arch i used.
+* More datasets.
+* We suspect we took too much grad acc. Should be better tuned. 
+* rewrite experiments sections
 
 ## Acknowledgments
 
 This project wouldn't be possible without the fantastic work of Andrej Karpathy and his repository, [nanoGPT](https://github.com/karpathy/nanoGPT). The original codebase provided a starting point, which were instrumental in developing this project. I am incredibly grateful for his work in the open source community globally.
+We would also like to thanks Sherjil Ozair for pushing us to shared this repo. 

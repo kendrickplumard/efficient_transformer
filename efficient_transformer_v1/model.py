@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import torch.nn.parallel
 
 from dataclasses import dataclass, field
+from torchao.prototype.low_bit_optim import AdamW8bit
 from torch.utils.checkpoint import checkpoint_sequential
 
 class SwiGLU(nn.Module):
@@ -140,11 +141,11 @@ class LocalCausalSelfAttention(nn.Module):
         if not use_soft_experts:
           self.csa_to_qkv = nn.Linear(self.in_n_embd, 3 * self.out_n_embd, bias=config.bias)
         else:
-          if self.config.use_same_key_for_soft_experts:
+          if self.config.use_same_kv_for_soft_experts:
             self.csa_to_q = nn.Linear(self.in_n_embd, self.nb_non_shared_soft_experts * self.out_n_embd, bias=config.bias)
             self.csa_to_kv = nn.Linear(self.in_n_embd, 2 * self.out_n_embd, bias=config.bias)
           else:
-            self.csa_to_qkv = nn.Linear(self.n_embd, 3 * (self.n_embd * self.nb_non_shared_soft_experts), bias=config.bias)
+            self.csa_to_qkv = nn.Linear(self.in_n_embd, 3 * (self.out_n_embd * self.nb_non_shared_soft_experts), bias=config.bias)
 
         # output projection
         self.csa_proj_to_embd = nn.Linear(self.out_n_embd, self.out_n_embd, bias=config.bias)
@@ -177,7 +178,7 @@ class LocalCausalSelfAttention(nn.Module):
         k = k.view(B, ng, ls, self.n_head, self.out_n_embd // self.n_head).transpose(2, 3) # (B, ng, nh, ls, hs)
         v = v.view(B, ng, ls, self.n_head, self.out_n_embd // self.n_head).transpose(2, 3) # (B, ng, nh, ls, hs)
       else:
-        if self.config.use_same_key_for_soft_experts:
+        if self.config.use_same_kv_for_soft_experts:
           k, v  = self.csa_to_kv(x).split(self.out_n_embd, dim=-1) # B, ng, ls, n_embd # local mem tok will also be up dim here if any
           q = self.csa_to_q(x).view(B, ng, ls, self.nb_non_shared_soft_experts, self.out_n_embd).transpose(2, 3) # B, ng, nse, ls, n_embd
           # q, k layer norm before attention
@@ -255,7 +256,7 @@ class GlobalCausalSelfAttention(nn.Module):
         if not use_soft_experts:
           self.csa_to_qkv = nn.Linear(self.n_embd, 3 * self.n_embd, bias=config.bias)
         else:
-          if self.config.use_same_key_for_soft_experts:
+          if self.config.use_same_kv_for_soft_experts:
             self.csa_to_q = nn.Linear(self.n_embd, self.nb_non_shared_soft_experts * self.n_embd, bias=config.bias)
             self.csa_to_kv = nn.Linear(self.n_embd, 2 * self.n_embd, bias=config.bias)
           else:
@@ -292,7 +293,7 @@ class GlobalCausalSelfAttention(nn.Module):
           k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
           v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         else:
-          if self.config.use_same_key_for_soft_experts:
+          if self.config.use_same_kv_for_soft_experts:
             q = self.csa_to_q(x).view(B, T, self.nb_non_shared_soft_experts, self.n_embd).transpose(1, 2) # B, nse, T, n_embd
             k, v  = self.csa_to_kv(x).split(self.n_embd, dim=-1) # B, T, n_embd
             # q, k layer norm before attention
@@ -345,7 +346,7 @@ class MLP(nn.Module):
 
     def __init__(self, config, n_embd, csa_type = 'global', use_soft_experts = False):
         super().__init__()
-        # double hdim because swiglu activation
+        # double hdim because gating in swiglu activation
         self.config = config
         self.n_embd = n_embd
         self.csa_type = csa_type
@@ -357,11 +358,12 @@ class MLP(nn.Module):
           self.mlp_out_proj  = nn.Linear(4 * self.n_embd, self.n_embd, bias=config.bias)
         else:
           assert self.nb_non_shared_soft_experts != 0, "should have at least one non shared expert to consider a mlp soft expert case"
-          self.non_shared_soft_experts = nn.Parameter(torch.randn(self.nb_non_shared_soft_experts, 4 * self.n_embd, config.coeff_soft_expert_mlp_dim * self.n_embd // self.config.nb_soft_experts),
-                                                      requires_grad=True) # don't bother with bias
+          self.soft_experts_out_dim = int(self.config.coeff_soft_expert_mlp_dim * self.n_embd // self.config.nb_soft_experts)
+          self.non_shared_soft_experts = nn.ParameterList([nn.Parameter(torch.randn(4 * self.n_embd, self.soft_experts_out_dim),
+                                                      requires_grad=True) for _ in range(self.nb_non_shared_soft_experts)]) # enable parallel computation with stack # don't bother with bias
           if config.nb_shared_experts != 0:
-            self.shared_soft_experts = nn.Parameter(torch.randn(config.nb_shared_experts, 4 * self.n_embd, config.coeff_soft_expert_mlp_dim * self.n_embd // self.config.nb_soft_experts),
-                                                    requires_grad=True)
+            self.shared_soft_experts = nn.ParameterList([nn.Parameter(torch.randn(4 * self.n_embd, self.soft_experts_out_dim),
+                                                    requires_grad=True) for _ in range(config.nb_shared_experts)])
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -372,22 +374,34 @@ class MLP(nn.Module):
       if (self.csa_type == 'local'):
         B, ng, nse, T, C = x.size()
         if self.config.nb_shared_experts != 0:
-          shared_experts_out = self.dropout(torch.matmul(x.repeat(self.config.nb_shared_experts, 1, 1, 1, 1), self.shared_soft_experts.view(self.config.nb_shared_experts, 1, 1, 4 * self.n_embd, -1).
-                                         repeat(B, ng, nse, 1, 1))).view(B, self.config.nb_shared_experts, ng, nse, T, -1).sum(dim=1)
-          return self.dropout(torch.matmul(x.transpose(1, 2).contiguous().view(B * nse, ng, T, -1),
-                            self.non_shared_soft_experts.view(nse, 1, 4 * self.n_embd, -1).repeat(B, ng, 1, 1))).view(B, nse, ng, T, -1).transpose(1,2).contiguous() + shared_experts_out
-
+          y = (
+              self.dropout(torch.einsum('bgntc,ncd->bgntd', x, torch.stack(list(self.non_shared_soft_experts)))) # B, ng, nse, T, soft_experts_out_dim
+              +
+              self.dropout(
+                  torch.einsum('bgmntc,mncd->bgmntd', 
+                               x.unsqueeze(2).expand(-1, -1, self.config.nb_shared_experts, -1, -1, -1),
+                               torch.stack(list(self.shared_soft_experts)).unsqueeze(1).expand(-1, nse, -1, -1)
+                  ).sum(dim=2)
+              )
+          )
         else:
-          return self.dropout(torch.matmul(x.transpose(1, 2).contiguous().view(B * nse, ng, T, C),
-                                           self.non_shared_soft_experts.view(nse, 1, 4 * self.n_embd, -1).repeat(B, ng, 1, 1))).view(B, nse, ng, T, -1).transpose(1,2).contiguous()
+          y = self.dropout(torch.einsum('bgntc,ncd->bgntd', x, torch.stack(list(self.non_shared_soft_experts)))) # B, ng, nse, T, soft_experts_out_dim
+        return y.contiguous()
 
       B, nse, T, C = x.size()
       if self.config.nb_shared_experts != 0:
-          shared_experts_out = self.dropout(torch.matmul(x.repeat(self.config.nb_shared_experts, 1, 1, 1), self.shared_soft_experts.view(self.config.nb_shared_experts, 1,  4 * self.n_embd, -1).
-                                         repeat(B, nse, 1, 1))).view(B, self.config.nb_shared_experts, nse, T, -1).sum(dim=1)
-          return self.dropout(torch.bmm(x.view(B * nse, T, C), self.non_shared_soft_experts.repeat(B, 1, 1))).contiguous().view(B, nse, T, -1) + shared_experts_out
+          y = (
+                self.dropout(torch.einsum('bntc,ncd->bntd', x, torch.stack(list(self.non_shared_soft_experts)))) # B, nse, T, soft_experts_out_dim
+                +
+                self.dropout(
+                    torch.einsum('bmntc,mncd->bmntd', x.unsqueeze(1).expand(-1, self.config.nb_shared_experts, -1, -1, -1), 
+                                 torch.stack(list(self.shared_soft_experts)).unsqueeze(1).expand(-1, nse, -1, -1)
+                    ).sum(dim=1)
+                ) 
+          )
       else:
-          return self.dropout(torch.bmm(x.view(B * nse, T, C), self.non_shared_soft_experts.repeat(B, 1, 1))).contiguous().view(B, nse, T, -1)
+          y = self.dropout(torch.einsum('bntc,ncd->bntd', x, torch.stack(list(self.non_shared_soft_experts)))) # B, nse, T, soft_experts_out_dim
+      return y.contiguous()
 
 
 class BlockCausalSA(nn.Module):
@@ -405,14 +419,15 @@ class BlockCausalSA(nn.Module):
         self.block_csa_dropout = nn.Dropout(config.dropout)
         if (csa_type == 'local'):
           self.attn = LocalCausalSelfAttention(config, self.in_n_embd, self.out_n_embd, self.use_soft_experts)
+          self.res_proj_up_dim = nn.Linear(self.in_n_embd, self.out_n_embd, bias=config.bias) if (self.in_n_embd != self.out_n_embd) else None
         else:
           assert self.in_n_embd == self.out_n_embd, "should have the same embd dim in and out for global csa block"
           self.attn = GlobalCausalSelfAttention(config, self.out_n_embd, self.use_soft_experts)
         self.ln_2 = RMSNorm(self.out_n_embd) if config.normalization == 'rmsnorm' else LayerNorm(self.out_n_embd, bias=config.bias)
         self.mlp = MLP(config, self.out_n_embd, csa_type, self.use_soft_experts)
-        self.res_proj_up_dim = nn.Linear(self.in_n_embd, self.out_n_embd, bias=config.bias) if (self.in_n_embd != self.out_n_embd) else None
         if self.use_soft_experts:
-          self.soft_experts_proj = nn.Linear(config.coeff_soft_expert_mlp_dim * self.out_n_embd // self.config.nb_soft_experts, self.out_n_embd)
+          self.soft_experts_out_dim = int(self.config.coeff_soft_expert_mlp_dim * self.out_n_embd // self.config.nb_soft_experts)
+          self.soft_experts_proj = nn.Linear(self.soft_experts_out_dim, self.out_n_embd, bias=config.bias)
 
     def forward(self, x, local_mem_tokens = None, mem_tokens = None):
         assert (mem_tokens != None and self.up_dim) or mem_tokens == None, "when define mem token should activate the up dim"
@@ -454,7 +469,7 @@ class TransformerEncoder(nn.Module):
         self.out_n_embd = config.n_embd[idx_n_embd + 1]
         self.latent_size = config.latent_size[idx_n_embd]
         use_soft_experts_in_enc =  (config.nb_soft_experts != 0) and ('enc' in self.config.apply_soft_experts_in_blocks)
-        self.up_dim_layer = BlockCausalSA(config, self.in_n_embd, self.out_n_embd, csa_type = 'local', use_soft_experts = use_soft_experts_in_enc)
+        self.up_dim_layer = BlockCausalSA(config, self.in_n_embd, self.out_n_embd, csa_type = 'local', use_soft_experts = use_soft_experts_in_enc) # should be global
         if config.n_block_transformer_enc > 1:
           self.attn_transfo_enc_blocks = nn.ModuleList([BlockCausalSA(config, self.out_n_embd, self.out_n_embd, csa_type = 'local',
                                                                       use_soft_experts = use_soft_experts_in_enc and (idx + 1) % config.apply_soft_experts_every == 0) for idx in range(config.n_block_transformer_enc - 1)])
@@ -642,9 +657,9 @@ class AnyModalMirasolConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     activation: str = 'swiglu' # gelu or swiglu
     normalization: str = 'rmsnorm' # layernorm or rmsnorm
-    noisy_embd_alpha: float = 10.0 # 0 if you don't want to use noisy embedding
-    nb_mem_token: int = 0 # nb memory / sink token
-    muP: bool = True # hyper-param transfer muP
+    noisy_embd_alpha: float = 10.0 # 0 if you don't want to use noisy embedding # https://openreview.net/pdf?id=0bMmZ3fkCk
+    nb_mem_token: int = 0 # nb memory / sink token # https://arxiv.org/pdf/2309.17453
+    muP: bool = True # hyper-param transfer muP # https://arxiv.org/pdf/2203.03466
     apply_gradient_checkpointing: bool = False # trade compute for memory
     gradient_checkpoint_sequential_factor: int = 2
     pos_embd: str = 'simple' # simple, no
@@ -655,71 +670,60 @@ class AnyModalMirasolConfig:
     n_block_transformer_enc: int = 2
     interleave_local_global_csa: bool = False # apply the fused block csa after each local csa or wait after all local csa apply to each group and then do all the global attn
     lernable_skip_hiearchy: bool = True
-    latent_causal_loss_type: str = 'cos_similarity' # None, 'cos_similarity' or 'siglip'
+    latent_causal_loss_type: str = 'cos_similarity' # None, 'cos_similarity' # https://arxiv.org/pdf/2311.05698
     nb_soft_experts: int = 2
     nb_shared_experts: int = 1 # add to the number of soft experts
-    use_same_key_for_soft_experts: bool = True
+    use_same_kv_for_soft_experts: bool = True
     apply_soft_experts_every: int = 1
     coeff_soft_expert_mlp_dim: int = 1 # each soft expert will have coeff_soft_expert_mlp_dim * n_embd / nb_soft_experts as output dim
     apply_soft_experts_in_blocks: list[str] = field(default_factory=lambda: ['latent']) # enc, latent
-    init_weight: str = 'nanogpt' # 'nanogpt', 'spike_no_more'
-    use_dense_former_in_latent: bool = True
+    init_weight: str = 'nanogpt' # 'nanogpt', 'spike_no_more' # overrides if muP
+    use_dense_former_in_latent: bool = True # https://arxiv.org/pdf/2402.02622
     use_pos_embd_in_enc_dec: bool = True
     up_sampling_type: str = 'attn' # 'attn' or 'repeat'
 
+def init_with_muP(pn, p, config):
+  special_weights = ['first_group_tokens_for_upsampling', 'lm_head.weight', 'shared_soft_experts', 'pos_embd_layers', 'wte', 'mem_token']
+  total_n_layer = 2 * config.n_layer_enc_dec * (2 * config.n_block_local_global_causal_sa) + config.n_block_latent_attn
+  coeff_std = math.sqrt(2 / 5) / math.sqrt(2 * total_n_layer)
+  if (p.dim() == 2) and not any(sub in pn for sub in special_weights):
+    fan_in = p.shape[1] # pytorch default linear shape: (out_features, in_features)
+    torch.nn.init.normal_(p, mean=0.0, std=coeff_std/(math.sqrt(fan_in)))
+
+  elif 'shared_soft_experts' in pn: # shared and non_shared
+    fan_in = p.shape[0] # (in_features, out_features)
+    torch.nn.init.normal_(p, mean=0.0, std=coeff_std/(math.sqrt(fan_in)))
+
+  elif 'lm_head.weight' in pn:
+    torch.nn.init.zeros_(p)
+
+def init_with_spike_no_more(pn, p, config):
+  # spike no more init: std=sigma/sqrt(2N) with sigma = sqrt(2/5d) and N = nb layers for W2, W0 # https://arxiv.org/pdf/2312.16903
+  total_n_layer = 2 * config.n_layer_enc_dec * (2 * config.n_block_local_global_causal_sa) + config.n_block_latent_attn
+  coeff_std = math.sqrt(2 / 5) / math.sqrt(2 * total_n_layer)
+  if any(subname in pn for subname in ['proj_to_embd', 'out_proj']):
+    fan_in = p.shape[1] # pytorch default linear shape: (out_features, in_features)
+    torch.nn.init.normal_(p, mean=0.0, std=coeff_std/(math.sqrt(fan_in)))
+  elif 'shared_soft_experts' in pn: # shared and non_shared
+    fan_in = p.shape[0] # (in_features, out_features)
+    torch.nn.init.normal_(p, mean=0.0, std=coeff_std/(math.sqrt(fan_in)))
+
+def init_with_nano_gpt(pn, p, config):
+  total_n_layer = 2 * config.n_layer_enc_dec * (2 * config.n_block_local_global_causal_sa) + config.n_block_latent_attn
+  if any(subname in pn for subname in ['proj_to_embd', 'out_proj', 'shared_soft_experts']):
+    torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * total_n_layer))
+
+
 def init_remaining_params(model_params, config):
   for pn, p in model_params:
-    if config.muP: # to update with the new arch # must deal with it first
-      if any(sub in pn for sub in ['enc_to_kv.weight', 'enc_to_q.weight', 'res_proj_up_dim.weight', 'up_dim_layer.attn.csa_to_qkv.weight']):
-        print(pn)
-        idx_n_embd = int(pn.split('.')[2])
-        torch.nn.init.normal_(p, mean=0.0, std=0.02/(math.sqrt(config.n_embd[idx_n_embd]))) # muP
-      elif pn.endswith('enc_proj_to_embd.weight') or pn.endswith('csa_proj_to_embd.weight'): # muP
-        idx_n_embd = int(pn.split('.')[2]) + 1
-        torch.nn.init.normal_(p, mean=0.0, std=0.02/(math.sqrt(config.n_embd[idx_n_embd]))) # muP
-      elif pn.endswith('mlp_out_proj.weight'): # muP: default all scale with 1/n_embd except out_proj with fan_in = 4 n_embd
-        idx_n_embd = int(pn.split('.')[2]) + 1
-        torch.nn.init.normal_(p, mean=0.0, std=0.02/(math.sqrt(4 * config.n_embd[idx_n_embd]))) # muP
-      elif pn.endswith('csa_to_qkv.weight') or pn.endswith('mlp_inner_proj.weight'):
-        idx_n_embd = int(pn.split('.')[2]) + 1
-        torch.nn.init.normal_(p, mean=0.0, std=0.02/(math.sqrt(config.n_embd[idx_n_embd]))) # muP
-      elif pn.endswith('wte.weight'): # muP
-        torch.nn.init.zeros_(p)
+    if config.muP:
+      init_with_muP(pn, p, config)
 
-    elif config.init_weight == 'nanogpt':
-      total_n_layer = 2 * config.n_layer_enc_dec * (2 * config.n_block_local_global_causal_sa) + config.n_block_latent_attn
-      if any(subname in pn for subname in ['proj_to_embd', 'out_proj']):
-        torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * total_n_layer))
-      elif 'non_shared_soft_experts' in pn:
-        for i in range(config.nb_soft_experts - config.nb_shared_experts):
-          torch.nn.init.normal_(p[i], mean=0.0, std=0.02/math.sqrt(2 * total_n_layer))
-      elif 'shared_soft_experts' in pn:
-        for i in range(config.nb_shared_experts):
-          torch.nn.init.normal_(p[i], mean=0.0, std=0.02/math.sqrt(2 * total_n_layer))
+    elif config.init_weight == 'spike_no_more':
+      init_with_spike_no_more(pn, p, config)
 
-    else:
-      # spike no more init: std=sigma/sqrt(2N) with sigma = sqrt(2/5d) and N = nb layers
-      total_n_layer = 2 * config.n_layer_enc_dec * (2 * config.n_block_local_global_causal_sa) + config.n_block_latent_attn
-      if ('proj_to_embd' in pn and 'latent_attn_h' not in pn):
-        idx_n_embd = int(pn.split('.')[2]) + 1
-        torch.nn.init.normal_(p, mean=0.0, std= math.sqrt(2 / (5 * config.n_embd[idx_n_embd])) / math.sqrt(2 * total_n_layer))
-      elif ('proj_to_embd' in pn and 'latent_attn_h' in pn):
-        idx_n_embd = - 1
-        torch.nn.init.normal_(p, mean=0.0, std= math.sqrt(2 / (5 * config.n_embd[idx_n_embd])) / math.sqrt(2 * total_n_layer))
-      elif ('out_proj' in pn and 'latent_attn_h' not in pn):
-        idx_n_embd = int(pn.split('.')[2]) + 1
-        torch.nn.init.normal_(p, mean=0.0, std= math.sqrt(2 / (5 * 4 * config.n_embd[idx_n_embd])) / math.sqrt(2 * total_n_layer))
-      elif (('out_proj' in pn and 'latent_attn_h' in pn)):
-        idx_n_embd = - 1
-        torch.nn.init.normal_(p, mean=0.0, std= math.sqrt(2 / (5 * 4 * config.n_embd[idx_n_embd])) / math.sqrt(2 * total_n_layer))
-      elif 'non_shared_soft_experts' in pn:
-        for i in range(config.nb_soft_experts - config.nb_shared_experts):
-          torch.nn.init.normal_(p[i], mean=0.0, std=0.02/math.sqrt(2 * total_n_layer))
-      elif 'shared_soft_experts' in pn:
-        for i in range(config.nb_shared_experts):
-          torch.nn.init.normal_(p[i], mean=0.0, std=0.02/math.sqrt(2 * total_n_layer))
-      elif ('lm_head' in pn):
-        torch.nn.init.normal_(p, mean=0.0, std= math.sqrt(2 / (5 * config.n_embd[0])) / math.sqrt(2 * total_n_layer))
+    else: # keep nanogpt init as defautlt
+      init_with_nano_gpt(pn, p, config)
 
 class AnyModalMirasol(nn.Module):
 
@@ -744,6 +748,9 @@ class AnyModalMirasol(nn.Module):
 
         self.input_skip_buffer = []
 
+        # if self.config.init_weight == 'spike_no_more':
+        #   self.ln_embd = RMSNorm(self.config.n_embd[0]) if config.normalization == 'rmsnorm' else LayerNorm(self.config.n_embd[0], bias=config.bias)
+
         if self.config.pos_embd == 'simple':
           pos_embd_layers = [nn.Embedding(self.config.block_size, self.config.n_embd[0])]
           if self.config.use_pos_embd_in_enc_dec: # instantiate it here to reuse param between enc and dec
@@ -767,7 +774,6 @@ class AnyModalMirasol(nn.Module):
           self.latent_prediction_head = nn.Linear(self.config.n_embd[-1], self.config.n_embd[-1], bias = True)
 
         self.lm_head = nn.Linear(config.n_embd[0], config.vocab_size, bias = self.config.bias)
-        self.head_ln = RMSNorm(config.n_embd[0]) if config.normalization == 'rmsnorm' else LayerNorm(config.n_embd[0], bias=config.bias)
         self.res_lerp = nn.Parameter(torch.randn(self.config.n_layer_enc_dec), # n_layer res connection between skip and upsample # torch.randn(self.config.n_layer)
                            requires_grad=True) if self.config.lernable_skip_hiearchy else None # make sure  is learnable
 
@@ -777,7 +783,8 @@ class AnyModalMirasol(nn.Module):
           self.local_csa_mem_tokens = nn.Parameter(torch.randn(self.config.n_groups * self.config.nb_mem_token, self.config.n_embd[0]), # [batch_size, nb_memory_token, n_embd]
                            requires_grad=True) # make sure the embedding is learnable
 
-
+        self.total_n_layer = 2 * config.n_layer_enc_dec * (2 * config.n_block_local_global_causal_sa) + config.n_block_latent_attn
+          
         # init all weights
         self.apply(self._init_weights)
         init_remaining_params(self.named_parameters(), config)
@@ -806,30 +813,38 @@ class AnyModalMirasol(nn.Module):
         """
         if isinstance(module, nn.Linear):
           if self.config.muP: # must deal with it first
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02 * 1/math.sqrt(self.config.n_embd[0])) # muP
-          elif self.config.init_weight == 'nano_gpt':
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02/math.sqrt(self.config.n_embd[0])) # muP
+          elif self.config.init_weight == 'spike_no_more':
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-          else:
+          else:  # nanoGPT as default
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
           if module.bias is not None:
             torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-          torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+          if self.config.muP: 
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+          if self.config.init_weight == 'spike_no_more':
+          # torch.nn.init.normal_(module.weight, mean=0.0, std=1) # spike no more paper https://arxiv.org/pdf/2312.16903
+            torch.nn.init.normal_(module.weight, mean=0.0, std= math.sqrt(2 / (5 * self.config.n_embd[0]))) # account for tok embd and all pos embd
+          else: # nanoGPT as default
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None, global_coeff_latent_causal_loss = 0.2, step_size_eval = 1):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         length_padding = 0
-        if t % self.config.n_groups != 0: # pad the last group
+        if t % self.config.n_groups != 0: # pad the last group if needed # should have a special pad
           length_padding = self.config.n_groups - t % self.config.n_groups
           t += length_padding
           idx = torch.cat([idx, torch.zeros(b, length_padding, dtype = idx.dtype).to(device)], dim = -1)
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+
 
         # forward the GPT model itself
         if self.config.init_weight == 'spike_no_more':
-          tok_emb = self.any_modal_mirasol.wte(idx) * self.config.n_embd[0] # token embeddings of shape (b, t, n_embd)
+          tok_emb = self.any_modal_mirasol.wte(idx) * self.config.n_embd[0] # token embeddings of shape (b, t, n_embd) # scaled embed
+          # tok_emb = self.ln_embd(tok_emb) # for now ignore the embd ln
         else:
           tok_emb = self.any_modal_mirasol.wte(idx) # token embeddings of shape
 
@@ -837,7 +852,7 @@ class AnyModalMirasol(nn.Module):
           eps = 2 * torch.rand(1) - 1
           tok_emb += ((self.config.noisy_embd_alpha / math.sqrt(tok_emb.size(-2) * tok_emb.size(-1))) * eps).to(device)
 
-        if self.config.pos_embd == 'no':
+        if self.config.pos_embd == 'no' or self.config.pos_embd == 'rope':
           pos_emb = torch.zeros(t, self.config.n_embd[0], dtype=torch.long, device=device) # (t, n_embd)
         else:
           pos_emb = self.pos_embd_layers[0](torch.arange(0, t, dtype=torch.long, device=device)) # position embeddings of shape (t, n_embd)
@@ -914,14 +929,14 @@ class AnyModalMirasol(nn.Module):
               else:
                 loss["total"] = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             else:
-              logits = logits[:, -step_size_eval:, :]
+              logits = logits[:, -step_size_eval:, :] # # can default to step_size=block size if want the full ct eval
               loss["total"] = F.cross_entropy(logits.contiguous().view(-1, logits.size(-1)),
                                    targets[:, -step_size_eval:].contiguous().view(-1), ignore_index=-1)
 
             loss["cross_entropy"] = loss["total"]
 
             if self.config.latent_causal_loss_type is not None:
-              assert 0.0 <= train_config.latent_causal_modeling_loss_coeff < 1.0, "latent_causal_modeling_loss_coeff should be between 0 and 1"
+              assert 0.0 <= global_coeff_latent_causal_loss < 1.0, "latent_causal_modeling_loss_coeff should be between 0 and 1"
               loss["latent_causal_modeling"] = self.latent_causal_loss(latent_reconstruction_predictions, latent_reconstruction_targets)
               loss["total"] = (1.0 - global_coeff_latent_causal_loss) * loss["cross_entropy"] + global_coeff_latent_causal_loss * loss["latent_causal_modeling"]
         else:
@@ -935,7 +950,6 @@ class AnyModalMirasol(nn.Module):
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
@@ -944,65 +958,62 @@ class AnyModalMirasol(nn.Module):
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, use_8_bit_optim, device_type):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        decay_params = [p for _, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for _, p in param_dict.items() if p.dim() < 2]
+        print(f"using muP: {self.config.muP}")
+
 
         if self.config.muP:
-          linear_params_decay = {self.config.n_embd[i]: {'n_embd': [], '4_n_embd': []} for i in range(len(self.config.n_embd))}
-          linear_params_names_decay = {self.config.n_embd[i]: {'n_embd': [], '4_n_embd': []} for i in range(len(self.config.n_embd))}
-          non_linear_params_decay, nodecay_params = [], []
-          non_linear_params_names_decay = []
+          special_weights = ['pos_embd_layers', 'wte', 'first_group_tokens_for_upsampling', 'shared_soft_experts', 'mem_token']
+          linear_decay_fan_in_params = {p.shape[1]: [] for n, p in param_dict.items() if (p.dim() == 2) and not any(sub in n for sub in special_weights)}
+          linear_decay_params_names = []
+          soft_expert_linear_decay_fan_in_params = {p.shape[0]: [] for n, p in param_dict.items() if 'shared_soft_experts' in n}
+          soft_expert_linear_decay_params_names = []
+          others_params_decay = []
+          others_params_names_decay = []
+          for pn,p in param_dict.items():
+            if p.dim() >=2: # skip no_decay params
+              if p.dim() == 2 and not any(sub in pn for sub in special_weights):
+                  linear_decay_fan_in_params[p.shape[1]].append(p)
+                  linear_decay_params_names.append(pn)
+              elif 'shared_soft_experts' in pn:
+                soft_expert_linear_decay_fan_in_params[p.shape[0]].append(p)
+                soft_expert_linear_decay_params_names.append(pn)
+              else:
+                others_params_decay.append(p)
+                others_params_names_decay.append(pn)
 
-          for pn,p in param_dict.items(): # muP
-            if p.dim() >=2:
-                # layer per layer, for each parameter's layer we deduce the corresponding embedding according to the block idx
-                if any(sub in pn for sub in ['enc_to_kv.weight', 'enc_to_q.weight', 'res_proj_up_dim.weight', 'up_dim_layer.attn.csa_to_qkv.weight']):
-                  idx_n_embd = int(pn.split('.')[2])
-                  (linear_params_decay[self.config.n_embd[idx_n_embd]]['n_embd']).append(p)
-                  (linear_params_names_decay[self.config.n_embd[idx_n_embd]]['n_embd']).append(pn)
-                elif any(sub in pn for sub in ['enc_proj_to_embd.weight', 'csa_to_qkv.weight', 'csa_proj_to_embd.weight', 'mlp_inner_proj.weight']):
-                  idx_n_embd = int(pn.split('.')[2]) + 1
-                  (linear_params_decay[self.config.n_embd[idx_n_embd]]['n_embd']).append(p)
-                  (linear_params_names_decay[self.config.n_embd[idx_n_embd]]['n_embd']).append(pn)
-                elif pn.endswith('mlp_out_proj.weight'):
-                  idx_n_embd = int(pn.split('.')[2]) + 1
-                  (linear_params_decay[self.config.n_embd[idx_n_embd]]['4_n_embd']).append(p)
-                  (linear_params_names_decay[self.config.n_embd[idx_n_embd]]['4_n_embd']).append(pn)
-                else:
-                  non_linear_params_decay.append(p)
-                  non_linear_params_names_decay.append(pn)
-            else:
-              nodecay_params.append(p)
-
-          linear_params_groups_n_embd = [
-              {'params': linear_params_decay[n_embd]['n_embd'], 'weight_decay': weight_decay, 'muPScale': n_embd, 'lr': learning_rate / n_embd} for n_embd in linear_params_decay.keys()
+          linear_decay_params_group = [
+              {'params': linear_decay_fan_in_params[fan_in], 'weight_decay': weight_decay, 'muPScale': fan_in, 'lr': learning_rate / fan_in} for fan_in in linear_decay_fan_in_params.keys()
               ]
 
-          linear_params_groups_4_n_embd = [
-              {'params': linear_params_decay[n_embd]['4_n_embd'], 'weight_decay': weight_decay, 'muPScale': 4 * n_embd, 'lr': learning_rate / (4 * n_embd)} for n_embd in linear_params_decay.keys()
+          soft_expert_linear_decay_params_groups = [
+              {'params': soft_expert_linear_decay_fan_in_params[fan_in], 'weight_decay': weight_decay, 'muPScale': fan_in, 'lr': learning_rate / fan_in} for fan_in in soft_expert_linear_decay_fan_in_params.keys()
               ]
-
+        
           others_params_groups =  [
-              {'params': non_linear_params_decay, 'weight_decay': weight_decay, 'muPScale': 1.0},
+              {'params': others_params_decay, 'weight_decay': weight_decay, 'muPScale': 1.0},
               {'params': nodecay_params, 'weight_decay': 0.0, 'muPScale': 1.0}
           ]
-          optim_groups = linear_params_groups_n_embd + linear_params_groups_4_n_embd + others_params_groups
-          num_decay_params = sum(p.numel() for n_embd in linear_params_decay.keys() for p in linear_params_decay[n_embd]['n_embd']) + sum(p.numel() for n_embd in linear_params_decay.keys() for p in linear_params_decay[n_embd]['4_n_embd']) + sum(p.numel() for p in non_linear_params_decay)
+          optim_groups = linear_decay_params_group + soft_expert_linear_decay_params_groups + others_params_groups
+          num_decay_params = sum(p.numel() for fan_in in linear_decay_fan_in_params.keys() for p in linear_decay_fan_in_params[fan_in]) + sum(p.numel() for fan_in in soft_expert_linear_decay_fan_in_params.keys() for p in soft_expert_linear_decay_fan_in_params[fan_in]) + sum(p.numel() for p in others_params_decay)
           num_nodecay_params = sum(p.numel() for p in nodecay_params)
-          num_tensors_decay_params = sum(len(linear_params_decay[n_embd]['n_embd']) for n_embd in linear_params_decay.keys()) + sum(len(linear_params_decay[n_embd]['4_n_embd']) for n_embd in linear_params_decay.keys()) + len(non_linear_params_decay)
-          print("linear params decay names and coeff", linear_params_names_decay)
-          print("Test de len decay param: ", num_tensors_decay_params == len(decay_params))
+          num_tensors_decay_params = sum(len(linear_decay_fan_in_params[fan_in]) for fan_in in linear_decay_fan_in_params.keys()) + sum(len(soft_expert_linear_decay_fan_in_params[fan_in]) for fan_in in soft_expert_linear_decay_fan_in_params.keys()) + len(others_params_decay)
+          print("names linear params with decay: ", linear_decay_params_names)
+          print("names soft experts mlp linear params with decay: ", soft_expert_linear_decay_params_names)
+          print("names others params with decay: ", others_params_names_decay)
+          print("test len decay param: ", num_tensors_decay_params == len(decay_params))
 
           print(f"num decayed parameter tensors: {num_tensors_decay_params}, with {num_decay_params:,} parameters")
           print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         else:
-          nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
           optim_groups = [
               {'params': decay_params, 'weight_decay': weight_decay},
               {'params': nodecay_params, 'weight_decay': 0.0}
@@ -1011,12 +1022,16 @@ class AnyModalMirasol(nn.Module):
           num_nodecay_params = sum(p.numel() for p in nodecay_params)
           print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
           print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters # Fused AdamW is a faster and more efficient implementation of the AdamW optimizer in PyTorch
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
+        
+        if not(use_8_bit_optim):
+          # Create AdamW optimizer and use the fused version if it is available
+          fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters # Fused AdamW is a faster and more efficient implementation of the AdamW optimizer in PyTorch
+          use_fused = fused_available and device_type == 'cuda'
+          extra_args = dict(fused=True) if use_fused else dict()
+          optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+          print(f"using fused AdamW: {use_fused}")
+        else:
+          optimizer = AdamW8bit(optim_groups, lr=learning_rate, betas=betas, weight_decay=0.0) # wd set on param group, don't override with their arg
 
         return optimizer
 

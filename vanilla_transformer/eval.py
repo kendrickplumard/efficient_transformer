@@ -1,5 +1,7 @@
 ### test model
 
+### test model
+
 import argparse
 import numpy as np
 import os
@@ -10,36 +12,34 @@ from contextlib import nullcontext
 
 from torch.utils.data import DataLoader
 
-from efficient_transformer_v1.config.train_config import TRAIN_CONFIG
-from efficient_transformer_v1.model import AnyModalMirasol, AnyModalMirasolConfig
-from efficient_transformer_v1.train_utils import CustomDataset, estimate_loss
+from vanilla_transformer.config.train_config import TRAIN_CONFIG
+from vanilla_transformer.model import GPT, GPTConfig
+from vanilla_transformer.train_utils import CustomDataset, estimate_loss
 
 torch._dynamo.config.suppress_errors = True
 
 train_config = TRAIN_CONFIG()
 
+# Argument parsing
 parser = argparse.ArgumentParser()
-# Add argument for checkpoint filename
 parser.add_argument("--ckpt_filename", type=str, 
                     help="Name of the checkpoint file to load.", 
-                    default='anymodal_mirasol.pt')
-# Parse the arguments
+                    default='gpt.pt')
 args = parser.parse_args()
+ckpt_filename = args.ckpt_filename 
 
 # -----------------------------------------------------------------------------
-# Access the checkpoint filename from args
-ckpt_filename = args.ckpt_filename 
-device = 'cuda' if torch.cuda.is_available() else 'cpu' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-compile = True # use PyTorch 2.0 to compile the model to be faster
+device = 'cuda' if torch.cuda.is_available() else 'cpu' 
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' 
+compile = True 
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
 torch.manual_seed(train_config.seed)
 torch.cuda.manual_seed(train_config.seed)
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+torch.backends.cuda.matmul.allow_tf32 = True 
+torch.backends.cudnn.allow_tf32 = True 
+device_type = 'cuda' if 'cuda' in device else 'cpu' 
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 # -----------------------------------------------------------------------------
@@ -47,8 +47,8 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # model
 ckpt_path = os.path.join(train_config.out_dir, ckpt_filename)
 checkpoint = torch.load(ckpt_path, map_location=device)
-gptconf = AnyModalMirasolConfig(**checkpoint['model_args'])
-model = AnyModalMirasol(gptconf)
+gptconf = GPTConfig(**checkpoint['model_args'])
+model = GPT(gptconf)
 state_dict = checkpoint['model']
 unwanted_prefix = '_orig_mod.'
 for k,v in list(state_dict.items()):
@@ -58,7 +58,6 @@ model.load_state_dict(state_dict)
 if train_config.use_schedule_free_lr:
     optimizer = schedulefree.AdamWScheduleFree(model.parameters()) # they update warmup counter every optimizer step
     optimizer.load_state_dict(checkpoint['optimizer'])
-
 
 model.eval()
 model.to(device)
